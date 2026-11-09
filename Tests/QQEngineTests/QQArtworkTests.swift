@@ -559,7 +559,9 @@ final class ArtworkFixtureProtocol: URLProtocol, @unchecked Sendable {
             engine.pause(); #expect(engine.queuedCount == 0)
         }
         let deadline = Date().addingTimeInterval(["foreign", "paused", "downloadPause", "scheduleNoImage", "scheduleQueued"].contains(mode) ? 0.5 : 5)
-        while Date() < deadline && engine.sends.confirmed == 0 && engine.sends.uncertain == 0 { try await Task.sleep(nanoseconds: 20_000_000) }
+        let separateArtwork = ["agent", "agentWithoutLicense"].contains(mode)
+        let expectedSends = separateArtwork ? 2 : 1
+        while Date() < deadline && engine.sends.confirmed < expectedSends && engine.sends.uncertain == 0 { try await Task.sleep(nanoseconds: 20_000_000) }
         if ["foreign", "paused"].contains(mode) {
             #expect(engine.sends.attempts == 0); #expect(ArtworkFixtureProtocol.calls.isEmpty)
         } else if mode == "scheduleNoImage" {
@@ -584,10 +586,15 @@ final class ArtworkFixtureProtocol: URLProtocol, @unchecked Sendable {
             #expect(engine.sends.uncertain == 1); #expect(!engine.running)
             #expect(engine.artworkLedger.deliveries.first?.state == "unknown")
         } else {
-            #expect(engine.sends.confirmed == 1)
+            #expect(engine.sends.confirmed == expectedSends)
             #expect(engine.artworkLedger.deliveries.first?.state == "confirmed")
-            let payload = try JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("payload"))) as! [String: Any]
-            let segments = payload["message"] as! [[String: Any]]
+            let lines = try String(contentsOf: directory.appendingPathComponent("payloads"), encoding: .utf8).split(separator: "\n")
+            let messages = try lines.map { line in
+                let payload = try #require(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                return try #require(payload["message"] as? [[String: Any]])
+            }
+            if separateArtwork { #expect(messages.map(\.count) == [1, 1]) }
+            let segments = messages.flatMap { $0 }
             #expect(segments.contains { $0["type"] as? String == "image" })
             #expect(segments.contains { (($0["data"] as? [String: String])?["text"] ?? "").contains("/next") })
             if mode == "qualitySearch" {
