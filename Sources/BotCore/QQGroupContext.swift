@@ -16,12 +16,10 @@ public struct QQGroupContext: Sendable {
             .filter { $0.element.at <= end }
             .sorted { $0.element.at == $1.element.at ? $0.offset < $1.offset : $0.element.at < $1.element.at }
             .map(\.element)
-        var selected: [QQMemoryEvent] = [], previous = end
+        var selected: [QQMemoryEvent] = []
         for event in ordered.reversed() {
-            // Sparse messages must not keep a conversation from an hour ago alive.
-            guard end.timeIntervalSince(event.at) <= 30 * 60,
-                  previous.timeIntervalSince(event.at) <= 10 * 60, selected.count < 32 else { break }
-            selected.append(event); previous = event.at
+            guard end.timeIntervalSince(event.at) <= 30 * 60, selected.count < 32 else { break }
+            selected.append(event)
         }
         self.events = selected.reversed()
         self.messages = messages.filter { key, _ in selected.contains { $0.id == key } }
@@ -45,10 +43,10 @@ public struct QQGroupContext: Sendable {
         }
     }
 
-    public func context(characters: Int) -> String {
+    public func context(characters: Int, excluding: Set<String> = []) -> String {
         var lines: [String] = [], used = 0
         let formatter = ISO8601DateFormatter()
-        for event in events.reversed() {
+        for event in events.reversed() where !excluding.contains(event.id) {
             let text = Self.readableText(event.text)
             let speaker = event.subject == "OWNER" ? "[OWNER] 本账号主人/开发者的人工发言" : event.subject
             var fields = ["message": event.id, "time": formatter.string(from: event.at), "speaker": speaker,
@@ -71,6 +69,7 @@ public struct QQGroupContext: Sendable {
     }
 
     public func speaker(for id: String) -> String? { events.first { $0.id == id }?.subject }
+    public var messageIDs: Set<String> { Set(events.map(\.id)) }
 
     public static let participationPrompt = """
     [QQ_PARTICIPATION] 本轮是主动加入群话题，只是一次是否适合开口的评估，不保证发言。先判断当前话题是否理解、谁对谁说、有无自然接话点。

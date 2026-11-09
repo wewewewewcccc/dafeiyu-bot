@@ -2,18 +2,19 @@ import Foundation
 
 /// A scoped server snapshot, bounded at the current incoming message (never future replies).
 public struct QQPrivateContext: Sendable {
+    public static let historyLimit = 32
     public let text: String
     public let memoryText: String
     public let messageIDs: Set<String>
     public let memoryEvents: [QQMemoryEvent]
-    public static func read(_ rows: [[String: Any]], for message: QQIncoming, selfID: String, excluding: Set<String> = [], botMessageIDs: Set<String> = [], ownershipSince: Double = .infinity) -> QQPrivateContext? {
+    public static func read(_ rows: [[String: Any]], for message: QQIncoming, selfID: String, excluding: Set<String> = [], botMessageIDs: Set<String> = [], ownershipSince: Double = .infinity, omitting: Set<String> = []) -> QQPrivateContext? {
         guard !message.group, rows.count <= 50,
               let anchor = rows.firstIndex(where: { QQPolicy.identifier($0["message_id"]) == message.id }),
               QQPolicy.identifier((rows[anchor]["sender"] as? [String: Any])?["user_id"]) == message.sender else { return nil }
         var entries: [(id: String, line: String)] = []
         var ids: Set<String> = []
         var memoryEvents: [QQMemoryEvent] = []
-        for row in rows.prefix(through: anchor).suffix(20) {
+        for row in rows.prefix(through: anchor).suffix(historyLimit) {
             guard row["message_type"] as? String == "private", row["sub_type"] as? String == "friend",
                   QQPolicy.identifier(row["self_id"]) == selfID,
                   let id = QQPolicy.identifier(row["message_id"]), Int64(id) != nil,
@@ -21,8 +22,11 @@ public struct QQPrivateContext: Sendable {
                   author == selfID || author == message.target,
                   let segments = row["message"] as? [[String: Any]] else { return nil }
             if let user = QQPolicy.identifier(row["user_id"]), user != author { return nil }
+            guard id == message.id || (row["time"] as? Double).map({
+                (message.time - 30 * 60...message.time).contains($0)
+            }) == true else { continue }
             guard ids.insert(id).inserted else { continue }
-            if id == message.id { continue } // Current text and actual images are supplied separately.
+            if id == message.id || omitting.contains(id) { continue } // The batch is supplied separately.
             var text = ""
             for segment in segments {
                 let data = segment["data"] as? [String: Any] ?? [:]

@@ -9,7 +9,13 @@ import BotCore
 
 enum AppFailure: LocalizedError {
     case message(String)
-    var errorDescription: String? { if case .message(let s) = self { return s }; return nil }
+    case emptyModelReply
+    var errorDescription: String? {
+        switch self {
+        case .message(let message): return message
+        case .emptyModelReply: return "模型未返回完整文字回复（stop），本次不发送"
+        }
+    }
 }
 
 func automationInterlock() -> AutomationInterlock {
@@ -211,8 +217,11 @@ struct DeepSeekClient {
                 }
                 continue
             }
-            guard choice.finish_reason == "stop", let text = choice.message.content?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+            guard choice.finish_reason == "stop" else {
                 throw AppFailure.message("模型未返回完整文字回复（\(choice.finish_reason ?? "unknown")），本次不发送")
+            }
+            guard let text = choice.message.content?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
+                throw AppFailure.emptyModelReply
             }
             if round == 0, toolHandler != nil, jsonOutput, QQPersona().decode(text, input: "").isFallback {
                 var assistant: [String: Any] = ["role": "assistant", "content": text]

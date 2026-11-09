@@ -23,7 +23,8 @@ let package = Package(
     products: [.executable(name: "WeChatAIBot", targets: ["WeChatAIBot"])],
     dependencies: dependencies,
     targets: [
-        .target(name: "BotCore", dependencies: crypto),
+        .systemLibrary(name: "CSQLite", pkgConfig: "sqlite3", providers: [.apt(["libsqlite3-dev"])]),
+        .target(name: "BotCore", dependencies: crypto + ["CSQLite"]),
         .executableTarget(name: "WeChatAIBot", dependencies: [.target(name: "BotCore")] + crypto + transport, exclude: desktopFiles),
         .testTarget(name: "BotCoreTests", dependencies: ["BotCore"]),
         .testTarget(name: "QQEngineTests", dependencies: ["WeChatAIBot"], exclude: ["onebot_fixture.py", "synthetic-images.json"])

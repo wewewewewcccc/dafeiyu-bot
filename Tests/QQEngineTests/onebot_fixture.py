@@ -32,6 +32,7 @@ with socket.socket() as server:
         accept = base64.b64encode(hashlib.sha1((fields['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
         conn.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n').encode())
         history_rows = []
+        next_send_id = 99
         injected = False
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
@@ -92,20 +93,23 @@ with socket.socket() as server:
                 data = [{'group_id': 99999, 'group_name': 'fixture group'}] if is_group else []
                 if shape == 'groupParticipation':
                     data.append({'group_id': 88888, 'group_name': 'second group'})
+            elif action == 'get_group_msg_history':
+                assert request['params'] == {'group_id': '99999', 'count': 32}
+                data = {'messages': []}
             elif action == 'get_friend_msg_history':
                 params = request['params']
                 assert params['user_id'] == '54321'
-                if params['count'] == 20:
+                if params['count'] == 32:
                     if 'message_seq' in params:
                         assert params['reverse_order'] is True
                         anchor = next(i for i, row in enumerate(history_rows) if str(row['message_id']) == params['message_seq'])
-                        data = {'messages': history_rows[max(0, anchor - 19):anchor + 1]}
+                        data = {'messages': history_rows[max(0, anchor - 31):anchor + 1]}
                     else:
                         if shape == 'privateOwnerIntervenes':
                             history_rows.append({'message_id': -202, 'message_type': 'private', 'sub_type': 'friend', 'self_id': 12345,
                                                  'user_id': 12345, 'sender': {'user_id': 12345}, 'time': time.time(),
                                                  'message': [{'type': 'text', 'data': {'text': '主人已经回答'}}]})
-                        data = {'messages': history_rows[-20:]}
+                        data = {'messages': history_rows[-32:]}
                 else:
                     assert params == {'user_id': '54321', 'message_seq': '-12', 'count': 1}
                     author = 12345 if shape == 'privateQuotedOwn' else 77777 if shape == 'privateQuotedWrongPeer' else 54321
@@ -122,14 +126,16 @@ with socket.socket() as server:
                     out.write(json.dumps(request['params']) + '\n')
                 if (directory / 'drop-send').exists():
                     break
-                data = {'message_id': 99}
+                sent_id = next_send_id
+                next_send_id += 2
+                data = {'message_id': sent_id}
                 if action == 'send_group_msg' and (directory / 'self-echo').exists():
                     echo_event = {'post_type': 'message_sent', 'time': time.time(), 'self_id': 12345,
                                   'user_id': 12345, 'sender': {'user_id': 12345}, 'message_type': 'group',
-                                  'sub_type': 'normal', 'group_id': 99999, 'message_id': 99,
+                                  'sub_type': 'normal', 'group_id': 99999, 'message_id': sent_id,
                                   'message': [{'type': 'text', 'data': {'text': 'BOT_AUTO_ECHO'}}]}
                     send(conn, echo_event)
-                    manual = dict(echo_event, message_id=100, message=[{'type': 'text', 'data': {'text': 'OWNER_CONCURRENT'}}])
+                    manual = dict(echo_event, message_id=sent_id + 1, message=[{'type': 'text', 'data': {'text': 'OWNER_CONCURRENT'}}])
                     send(conn, manual)
             else:
                 raise AssertionError('unexpected action: ' + action)

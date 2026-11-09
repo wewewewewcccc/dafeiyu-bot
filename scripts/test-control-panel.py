@@ -24,19 +24,20 @@ def onebot(mode='success', queue_control=None):
                     assert fields['authorization'] == 'Bearer synthetic-test-token'
                     accept = base64.b64encode(hashlib.sha1((fields['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
                     conn.sendall(('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + '\r\n\r\n').encode())
-                    injected, held_history, last_heartbeat = False, [], time.monotonic()
+                    injected, held_history, last_heartbeat = 0, [], time.monotonic()
                     while True:
                         if queue_control is not None:
                             if time.monotonic() - last_heartbeat >= 5:
                                 transport['send'](conn, {'post_type':'meta_event','meta_event_type':'heartbeat',
                                     'self_id':12345,'status':{'online':True,'good':True},'interval':5000})
                                 last_heartbeat = time.monotonic()
-                            if queue_control.get('inject') and not injected:
-                                for number in range(1, 11):
+                            if queue_control.get('inject', 0) > injected:
+                                for number in range(injected + 1, queue_control['inject'] + 1):
                                     transport['send'](conn, {'post_type':'message','message_type':'private','sub_type':'friend',
                                         'self_id':12345,'user_id':54321,'sender':{'user_id':54321},'message_id':number,
                                         'time':time.time(),'message':[{'type':'text','data':{'text':'synthetic queue check'}}]})
-                                injected = True
+                                injected = queue_control['inject']
+                                queue_control['last_injected'] = time.monotonic()
                             if queue_control.get('release'):
                                 for req in held_history:
                                     # Empty history also prevents model admission if an epoch guard regresses.
@@ -49,6 +50,24 @@ def onebot(mode='success', queue_control=None):
                         except (EOFError, ValueError, OSError): break
                         action = req['action']
                         if queue_control is not None and action == 'get_friend_msg_history':
+                            if queue_control.get('backfill'):
+                                params = req['params']
+                                assert params['count'] == 32 and params['user_id'] == '54321'
+                                requests = queue_control.setdefault('page_requests', [])
+                                requests.append(time.monotonic())
+                                now = time.time()
+                                def row(number, age):
+                                    return {'message_id':number,'message_type':'private','sub_type':'friend',
+                                        'self_id':12345,'sender':{'user_id':54321},'time':now-age,
+                                        'message':[{'type':'text','data':{'text':'synthetic archive row'}}]}
+                                if len(requests) == 1:
+                                    assert 'message_seq' not in params
+                                    rows = [row(200, 7200), row(201, 3600)]
+                                else:
+                                    assert params['message_seq'] == '200' and params['reverse_order'] is True
+                                    rows = [row(199, 366 * 86400), row(200, 7200)]
+                                transport['send'](conn, {'status':'ok','retcode':0,'data':{'messages':rows},'echo':req['echo']})
+                                continue
                             held_history.append(req)
                             queue_control['history_requests'] = queue_control.get('history_requests', 0) + 1
                             continue
@@ -264,13 +283,18 @@ with tempfile.TemporaryDirectory(prefix='dafeiyu-panel-test-') as folder:
             assert not configured['error']
             started = action({'action':'start','durationMinutes':1})
             assert started['running']
-            queue_control['inject'] = True
-            deadline = time.monotonic() + 5
+            queue_control['inject'] = 5
+            time.sleep(2)
+            assert queue_control.get('history_requests', 0) == 0
+            queue_control['inject'] = 10
+            time.sleep(2)
+            assert queue_control.get('history_requests', 0) == 0, 'second burst must reset the timer'
+            deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
                 queued = json.loads(request('/api/status', headers)[1])
-                if queued['queued'] == 9 and queue_control.get('history_requests') == 1: break
+                if queued['queued'] == 0 and queue_control.get('history_requests') == 1: break
                 time.sleep(0.05)
-            assert queued['running'] and queued['queued'] == 9 and queue_control.get('history_requests') == 1, {
+            assert queued['running'] and queued['queued'] == 0 and queue_control.get('history_requests') == 1, {
                 'running':queued['running'],'queued':queued['queued'],'history_requests':queue_control.get('history_requests'),
                 'rejected':queued['rejected'],'error':queued['error']}
             assert queued['calls'] == 0 and queued['confirmed'] == 0
@@ -287,10 +311,29 @@ with tempfile.TemporaryDirectory(prefix='dafeiyu-panel-test-') as folder:
                 assert current['calls'] == 0 and current['confirmed'] == 0 and current['uncertain'] == 0
                 time.sleep(0.05)
             assert queue_control.get('history_requests') == 1 and queue_control.get('released') == 1
+            queue_control['inject'] = 11
+            time.sleep(0.3)
             action({'action':'pause'})
+            time.sleep(3)
+            assert queue_control.get('history_requests') == 1, 'pause must cancel a pending burst'
+            queue_control['backfill'] = True
+            saved = action({'action':'save','ai':started['config']['ai'],'enabled':['private:54321'],'memoryEnabled':True})
+            assert not saved['error']
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                archived = json.loads(request('/api/status', headers)[1])
+                if '历史补录完成' in archived['historyStatus']: break
+                time.sleep(0.05)
+            assert '历史补录完成' in archived['historyStatus']
+            pages = queue_control['page_requests']
+            assert len(pages) == 2 and pages[1] - pages[0] >= .95
+            assert archived['calls'] == 0 and archived['confirmed'] == 0
+            import sqlite3
+            with sqlite3.connect(pathlib.Path(folder)/'qq-history.sqlite3') as archive:
+                assert archive.execute('SELECT scope,id FROM messages ORDER BY id').fetchall() == [('12345:private:54321','200'), ('12345:private:54321','201')]
             cleared = action({'action':'clear'})
             assert not cleared['connected'] and not cleared['running']
-        print('PASS: ten synthetic events produce nine queued replies; pause clears queue, restart ignores late history, zero model/send calls')
+        print('PASS: burst debounce and pause cancellation; paginated history import with retention and zero model calls')
         assert request('/api/status', headers)[0] == 200
         print('PASS: assets, authentication, Origin/Host, malformed requests, connection/reply persistence, stale editor rejection, stale pause, unknown scope rejection, independent image/vision/artwork persistence, invalid tool configuration rollback, identity/online rejection, saved-config start, pause/clear lifecycle, isolated zero-send state')
     finally:

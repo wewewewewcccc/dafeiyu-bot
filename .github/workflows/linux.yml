@@ -19,7 +19,7 @@ jobs:
           git config --global --add safe.directory "$(pwd -P)"
           echo "DAFEIYU_RESOURCES=$(pwd -P)/Resources" >> "$GITHUB_ENV"
       - name: Image and test dependencies
-        run: apt-get update && apt-get install -y python3 python3-pil
+        run: apt-get update && apt-get install -y python3 python3-pil libsqlite3-dev
       - name: Privacy check
         run: python3 scripts/check-public.py
       - name: Verify OneBot transport before integration cases

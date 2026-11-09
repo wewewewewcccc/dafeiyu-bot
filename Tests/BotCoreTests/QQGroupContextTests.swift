@@ -53,6 +53,15 @@ struct QQGroupContextTests {
         #expect(text.contains("time")); #expect(QQGroupContext(events: rows, through: "missing") == nil)
         for line in text.split(separator: "\n") { #expect(try JSONSerialization.jsonObject(with: Data(line.utf8)) is [String: String]) }
     }
+
+    @Test func keepsRecentMessagesAcrossLongGaps() throws {
+        let rows = [event("1", "out of range", 0), event("2", "within window", 1),
+                    event("3", "trigger", 31)]
+        let context = try #require(QQGroupContext(events: rows, through: "3"))
+        let text = context.context(characters: 5000)
+        #expect(text.contains("within window"))
+        #expect(!text.contains("out of range"))
+    }
     @Test func recentMediaAfterBotIsNotAnUnansweredTextTopic() throws {
         let rows = [event("1", "周末去跑步", 0), event("2", "记得带水", 1, subject: "BOT"),
                     event("3", "（QQ 内置表情 ID 492，含义不确定时不要猜）", 2)]

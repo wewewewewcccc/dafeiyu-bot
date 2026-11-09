@@ -498,7 +498,7 @@ final class ArtworkFixtureProtocol: URLProtocol, @unchecked Sendable {
             stored["artworkLedger"] = try JSONSerialization.jsonObject(with: JSONEncoder().encode(ledger))
             try JSONSerialization.data(withJSONObject: stored).write(to: file)
         }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), artworkLibrary: library)
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), artworkLibrary: library, replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         engine.config.memoryEnabled = !["agent", "agentWithoutLicense", "agentBadImage"].contains(mode) // Commands must not queue memory learning even when enabled.

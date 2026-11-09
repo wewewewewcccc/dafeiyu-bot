@@ -237,7 +237,7 @@ import BotCore
                 "artworkNetworkCalls": engine.artworkLedger.networkCalls,
                 "artworkConfirmed": engine.artworkLedger.deliveries.filter { $0.state == "confirmed" }.count,
                 "memoryOptions": try JSONSerialization.jsonObject(with: JSONEncoder().encode(engine.config.effectiveMemoryOptions)),
-                "memoryStatus": engine.memoryStatus, "memoryBusy": engine.memoryBusy,
+                "memoryStatus": engine.memoryStatus, "memoryBusy": engine.memoryBusy, "historyStatus": engine.historyStatus,
                 "memories": engine.memoryBooks.filter { $0.key.hasPrefix(engine.config.expectedSelfID + ":") }.sorted { $0.key < $1.key }.map { key, book in
                     ["key": key, "summary": book.items.filter { $0.current(Date()) }.suffix(32).map { "[\($0.subject)·\($0.kind)] \($0.text)" }.joined(separator: "\n"), "updatedAt": (book.lastCompactedAt ?? book.recent.last?.at ?? Date.distantPast).timeIntervalSince1970, "pending": book.pending.count, "items": book.items.filter { $0.current(Date()) }.count, "dropped": book.droppedEvents] as [String: Any]
                 },

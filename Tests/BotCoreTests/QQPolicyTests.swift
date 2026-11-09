@@ -155,3 +155,12 @@ struct QQPolicyTests {
         }
     }
 }
+@Test func splitsQQReplyAndBuildsImageOnlyMessage() {
+    #expect(QQPolicy.replyParts("Version 6.1 is ready. Try swift.org, then install. 好了。继续；结束!") ==
+        ["Version 6.1 is ready. Try swift.org", "then install. 好了", "继续", "结束"])
+    #expect(QQPolicy.replyParts("根据你的回复，我并不知道你怎么了。") == ["根据你的回复", "我并不知道你怎么了"])
+    #expect(QQPolicy.replyParts("温度 36.5；打开 https://example.com/a?q=1。好了！") == ["温度 36.5", "打开 https://example.com/a?q=1", "好了"])
+    let target = QQTarget(number: "12345", name: "fixture", group: false)
+    let (_, params) = QQPolicy.sendAction(target: target, text: "", image: Data([1]))
+    #expect((params["message"] as? [[String: Any]])?.compactMap { $0["type"] as? String } == ["image"])
+}

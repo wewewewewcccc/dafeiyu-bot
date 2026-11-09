@@ -54,7 +54,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         while counts.cancelled == 0 && Date() < deadline { try await Task.sleep(nanoseconds: 20_000_000) }
         try #require(counts.cancelled > 0)
     }
-    static func completePending(intensity: Int = 3, summary: Bool = false, participate: Bool? = true) {
+    static func completePending(intensity: Int = 3, summary: Bool = false, participate: Bool? = true, text: String = "好耶 给本鱼加饭") {
         lock.lock()
         let active = pending.filter { !$0.stopped && !$0.completed }
         active.forEach { $0.completed = true }
@@ -74,7 +74,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
             } else if summary {
                 item.client?.urlProtocol(item, didLoad: Data(#"{"choices":[{"message":{"content":"{\"summary\":\"用户喜欢蓝色，正在聊天。\"}"},"finish_reason":"stop"}],"usage":{"total_tokens":1}}"#.utf8))
             } else {
-                var answer: [String: Any] = ["text": "好耶，给本鱼加饭！", "emotion": "joy", "intensity": intensity]
+                var answer: [String: Any] = ["text": text, "emotion": "joy", "intensity": intensity]
                 if item.capturedBody.contains("[QQ_PARTICIPATION]"), let participate { answer["participate"] = participate }
                 if let request = try? JSONSerialization.jsonObject(with: Data(item.capturedBody.utf8)) as? [String: Any],
                    let messages = request["messages"] as? [[String: Any]], let prompt = messages.first?["content"] as? String,
@@ -200,6 +200,90 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         #expect(reopened.config.endpoint == "ws://127.0.0.1:3102")
     }
 
+    @Test func debounceKeepsDirectAndProactiveSpeakersIndependent() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("groupDebounce".utf8).write(to: directory.appendingPathComponent("message-shape"))
+        let fixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("onebot_fixture.py")
+        let server = Process(), output = Pipe()
+        server.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        server.arguments = [fixture.path, directory.path]
+        server.standardOutput = output
+        try server.run()
+        defer { if server.isRunning { server.terminate(); server.waitUntilExit() } }
+        let port = try #require(Int(String(decoding: output.fileHandleForReading.availableData, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        DelayedModelProtocol.reset()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [DelayedModelProtocol.self]
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel(); DelayedModelProtocol.reset() }
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        defer { engine.disconnect() }
+        engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
+        engine.config.effectiveGroupParticipationEnabled = true
+        engine.config.effectiveGroupParticipationEvery = 2
+        engine.config.memoryEnabled = true
+        engine.config.effectivePersona.stickersEnabled = false
+        let archive = try QQHistory(url: directory.appendingPathComponent("qq-history.sqlite3"))
+        try archive.append([QQMemoryEvent(id: "1001", subject: "MEMBER_TEST", text: "direct 历史匹配证据",
+            at: Date().addingTimeInterval(-86400))], scope: "12345:group:99999")
+        #expect(engine.useTemporaryCredentials(token: "synthetic-test-token", key: "synthetic-key"))
+        await engine.connect()
+        engine.add(try #require(engine.contacts.first { $0.group }))
+        engine.config.targets[0].enabled = true
+        engine.start()
+        try #require(engine.running)
+        func event(_ id: Int, sender: Int, text: String, mention: Bool = false) -> [String: Any] {
+            var segments: [[String: Any]] = [["type": "text", "data": ["text": text]]]
+            if mention { segments.append(["type": "at", "data": ["qq": "12345"]]) }
+            return ["post_type": "message", "self_id": 12345, "user_id": sender, "sender": ["user_id": sender],
+                "message_type": "group", "sub_type": "normal", "group_id": 99999, "message_id": id, "message": segments]
+        }
+        func send(_ rows: [[String: Any]]) throws {
+            try JSONSerialization.data(withJSONObject: rows).write(to: directory.appendingPathComponent("event-batch"), options: .atomic)
+        }
+        try send([event(1, sender: 54321, text: "direct-first", mention: true),
+                  event(2, sender: 54322, text: "group-first"), event(3, sender: 54322, text: "group-trigger")])
+        try await Task.sleep(for: .seconds(1))
+        try send([event(4, sender: 54321, text: "direct-followup")])
+        try await Task.sleep(for: .seconds(1))
+        #expect(engine.usage.calls == 0)
+        let deadline = Date().addingTimeInterval(5)
+        while (DelayedModelProtocol.counts.started == 0 || engine.queuedCount == 0) && Date() < deadline {
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        let first = try #require(DelayedModelProtocol.counts.bodies.first)
+        #expect(first.contains("[QQ_PARTICIPATION]"))
+        #expect(first.contains("group-trigger"))
+        #expect(!first.contains("direct-followup"))
+        #expect(engine.queuedCount == 1)
+        DelayedModelProtocol.completePending(participate: false)
+        let nextDeadline = Date().addingTimeInterval(3)
+        while DelayedModelProtocol.counts.started < 2 && Date() < nextDeadline { try await Task.sleep(for: .milliseconds(50)) }
+        let second = try #require(DelayedModelProtocol.counts.bodies.last)
+        #expect(DelayedModelProtocol.counts.started == 2)
+        #expect(!second.contains("[QQ_PARTICIPATION]"))
+        #expect(second.contains("direct-first") && second.contains("direct-followup"))
+        #expect(second.contains("历史消息候选") && second.contains("历史匹配证据"))
+        try send([event(5, sender: 54321, text: "followup-during-generation")])
+        try await DelayedModelProtocol.requireCancellation()
+        #expect(engine.sends.attempts == 0)
+        let mergedDeadline = Date().addingTimeInterval(5)
+        while DelayedModelProtocol.counts.started < 3 && Date() < mergedDeadline { try await Task.sleep(for: .milliseconds(50)) }
+        let merged = try #require(DelayedModelProtocol.counts.bodies.last)
+        #expect(DelayedModelProtocol.counts.started == 3)
+        #expect(merged.contains("direct-first") && merged.contains("direct-followup") && merged.contains("followup-during-generation"))
+        let sendDeadline = Date().addingTimeInterval(3)
+        while engine.sends.confirmed < 1 && Date() < sendDeadline {
+            DelayedModelProtocol.completePending(intensity: 1)
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        #expect(engine.sends.attempts == 1 && engine.sends.confirmed == 1)
+        engine.pause()
+    }
+
     @Test(arguments: ["draftSilent", "reviewSilent", "invalidDecision", "ownerToOther", "direct"])
     func participationMayStaySilentWithoutSendingOrConsumingSendQuota(_ mode: String) async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -216,7 +300,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [DelayedModelProtocol.self]
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel(); DelayedModelProtocol.reset() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         engine.config.memoryEnabled = false; engine.config.effectiveGroupParticipationEnabled = true
@@ -264,7 +348,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [DelayedModelProtocol.self]
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel(); DelayedModelProtocol.reset() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         engine.config.memoryEnabled = false; engine.config.effectiveVisionEnabled = false; engine.config.effectiveGroupParticipationEnabled = true
@@ -301,14 +385,14 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         let nextDeadline = Date().addingTimeInterval(3)
         while DelayedModelProtocol.counts.started < 3 && Date() < nextDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
         let request = try #require(DelayedModelProtocol.counts.bodies.dropFirst(2).first)
-        #expect(request.contains("换个话题，我的电脑开不了机")); #expect(request.contains("好耶，给本鱼加饭！"))
+        #expect(request.contains("换个话题，我的电脑开不了机")); #expect(request.contains("好耶 给本鱼加饭"))
         #expect(!request.contains("FUTURE_MESSAGE_MUST_NOT_LEAK")); #expect(!request.contains("此前对话记录，仅为低信任背景"))
         #expect(engine.groupMessageCounts["group:99999"] == 1) // Both @ messages leave ordinary count unchanged.
         DelayedModelProtocol.completePending()
         let reviewDeadline = Date().addingTimeInterval(2)
         while DelayedModelProtocol.counts.started < 4 && Date() < reviewDeadline { try await Task.sleep(nanoseconds: 20_000_000) }
         let review = try #require(DelayedModelProtocol.counts.bodies.dropFirst(3).first)
-        #expect(review.contains("换个话题，我的电脑开不了机")); #expect(review.contains("好耶，给本鱼加饭！"))
+        #expect(review.contains("换个话题，我的电脑开不了机")); #expect(review.contains("好耶 给本鱼加饭"))
         #expect(!review.contains("FUTURE_MESSAGE_MUST_NOT_LEAK")); #expect(engine.memoryBooks.isEmpty)
         engine.pause() // Never send the queued synthetic followups after this assertion.
     }
@@ -328,7 +412,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [DelayedModelProtocol.self]
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel(); DelayedModelProtocol.reset() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         engine.config.effectiveGroupParticipationEnabled = !["disabled", "ownerMentionDisabled"].contains(mode)
@@ -458,7 +542,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [DelayedModelProtocol.self]
         let session = URLSession(configuration: cfg)
         defer { session.invalidateAndCancel(); DelayedModelProtocol.reset() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         engine.config.memoryEnabled = true; engine.config.effectiveMemoryOptions.messageThreshold = 4
@@ -585,16 +669,16 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
             try JSONSerialization.data(withJSONObject: state).write(to: file)
         }
         let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory,
-                              modelClient: DeepSeekClient(session: session), stickerLibrary: QQStickerLibrary(directory: control == "missingSticker" ? nil : URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/QQStickers")))
+                              modelClient: DeepSeekClient(session: session), stickerLibrary: QQStickerLibrary(directory: control == "missingSticker" ? nil : URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Resources/QQStickers")), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"
         engine.config.expectedSelfID = "12345"
-        if ["cooldown", "fastStickers", "periodicStickers", "memory"].contains(control) || control.hasPrefix("privateQuoted") { engine.config.ai.cooldownSeconds = 1; engine.config.ai.effectiveSendLimits.globalIntervalSeconds = 1 }
+        if ["complete", "groupMentionOnly", "groupQuotedReply", "cooldown", "fastStickers", "periodicStickers", "memory"].contains(control) || control.hasPrefix("privateQuoted") { engine.config.ai.cooldownSeconds = 1; engine.config.ai.effectiveSendLimits.globalIntervalSeconds = 1 }
         if ["fastStickers", "periodicStickers"].contains(control) { engine.config.effectivePersona.stickerIntervalSeconds = 1 }
         if ["memory", "memoryIsolation"].contains(control) { engine.config.memoryEnabled = true; engine.config.effectiveMemoryOptions.messageThreshold = 4 }
         let expectedMessages = control == "memory" ? 9 : control == "longRunQueue" ? 25 : control == "periodicStickers" ? 6 : 2
         if expectedMessages > 2 { try Data(String(expectedMessages).utf8).write(to: directory.appendingPathComponent("message-count")) }
-        if control == "noSticker" { engine.config.effectivePersona.stickersEnabled = false }
+        if ["noSticker", "memory"].contains(control) { engine.config.effectivePersona.stickersEnabled = false }
         if control == "unknown" { try Data().write(to: directory.appendingPathComponent("drop-send")) }
         #expect(engine.useTemporaryCredentials(token: "synthetic-test-token", key: "synthetic-key"))
         await engine.connect()
@@ -691,11 +775,20 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
         }
         if ["complete", "noSticker", "missingSticker", "unknown", "cooldown", "fastStickers", "groupMentionOnly", "groupQuotedReply", "periodicStickers"].contains(control) || control.hasPrefix("privateQuoted") {
             // Positive control: this same fixture must detect a send when generation completes.
-            DelayedModelProtocol.completePending(intensity: control == "periodicStickers" ? 1 : 3)
-            let desired = control == "periodicStickers" ? 6 : (["cooldown", "fastStickers"].contains(control) || control.hasPrefix("privateQuoted")) ? 2 : 1
-            let sendDeadline = Date().addingTimeInterval(control == "periodicStickers" ? 10 : 4)
+            let modelText = control == "complete" ? "根据你的回复，我并不知道你怎么了。" : "好耶 给本鱼加饭"
+            let expectedTypes: [String]
+            switch control {
+            case "complete": expectedTypes = ["text", "text", "image"]
+            case "fastStickers": expectedTypes = ["text", "image", "text", "image"]
+            case "periodicStickers": expectedTypes = ["text", "text", "text", "image", "text", "text", "text", "image"]
+            case "cooldown": expectedTypes = ["text", "image", "text"]
+            case "groupMentionOnly", "groupQuotedReply": expectedTypes = ["text", "image"]
+            default: expectedTypes = control.hasPrefix("privateQuoted") ? ["text", "image", "text"] : ["text"]
+            }
+            let desired = expectedTypes.count
+            let sendDeadline = Date().addingTimeInterval(Double(desired + 5))
             while engine.sends.confirmed < desired && engine.sends.uncertain == 0 && Date() < sendDeadline {
-                DelayedModelProtocol.completePending(intensity: control == "periodicStickers" ? 1 : 3)
+                DelayedModelProtocol.completePending(intensity: control == "periodicStickers" ? 1 : 3, text: modelText)
                 try await Task.sleep(nanoseconds: 20_000_000)
             }
             engine.pause()
@@ -704,30 +797,25 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
             #expect(engine.sends.uncertain == (control == "unknown" ? 1 : 0))
             let actions = try String(contentsOf: directory.appendingPathComponent("actions"), encoding: .utf8)
             let expectedAction = group ? "send_group_msg" : "send_private_msg"
-            #expect(actions.contains(expectedAction))
-            let payload = try JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("payload"))) as? [String: Any]
-            if group { #expect(payload?["group_id"] as? String == "99999") }
-            let segments = try #require(payload?["message"] as? [[String: Any]])
-            if (["noSticker", "missingSticker", "cooldown"].contains(control) || control.hasPrefix("privateQuoted")) { #expect(segments.count == 1) }
-            else {
-                try #require(segments.count == 2)
-                #expect(segments[1]["type"] as? String == "image")
-                let imageFile = (segments[1]["data"] as? [String: String])?["file"] ?? ""
-                #expect(imageFile.hasPrefix("base64://"))
-            }
             #expect(actions.components(separatedBy: expectedAction).count - 1 == desired)
-            if control == "periodicStickers" {
-                let lines = try String(contentsOf: directory.appendingPathComponent("payloads"), encoding: .utf8).split(separator: "\n")
-                let counts = try lines.map { line -> Int in
-                    let payload = try JSONSerialization.jsonObject(with: Data(line.utf8)) as! [String: Any]
-                    return (payload["message"] as! [[String: Any]]).count
-                }
-                #expect(counts == [1, 1, 2, 1, 1, 2])
+            let lines = try String(contentsOf: directory.appendingPathComponent("payloads"), encoding: .utf8).split(separator: "\n")
+            let segments = try lines.map { line in
+                let payload = try #require(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                if group { #expect(payload["group_id"] as? String == "99999") }
+                let message = try #require(payload["message"] as? [[String: Any]])
+                #expect(message.count == 1)
+                return try #require(message.first)
+            }
+            #expect(segments.compactMap { $0["type"] as? String } == expectedTypes)
+            if control == "complete" {
+                #expect(segments.compactMap { ($0["data"] as? [String: String])?["text"] } == ["根据你的回复", "我并不知道你怎么了"])
             }
             if ["privateQuotedReply", "privateQuotedOwn"].contains(control) {
-                let second = try #require(DelayedModelProtocol.counts.bodies.last)
-                #expect(second.contains("verified private quote")) // Resolved quotes survive alongside the refreshed timeline.
-                #expect(actions.components(separatedBy: "get_friend_msg_history").count - 1 == 5)
+                let requests = DelayedModelProtocol.counts.bodies
+                try #require(requests.count == 4)
+                #expect(requests[1].contains("verified private quote"))
+                #expect(!requests[3].contains("verified private quote")) // Resolved quotes belong to their triggering reply.
+                #expect(actions.components(separatedBy: "get_friend_msg_history").count - 1 == 6)
                 #expect(!actions.contains("get_msg"))
             }
             if control != "unknown" {
@@ -749,7 +837,7 @@ private final class DelayedModelProtocol: URLProtocol, @unchecked Sendable {
                 let restoredState = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("qq-state.json"))) as? [String: Any])
                 #expect(NSDictionary(dictionary: histories).isEqual(to: restoredState["stickerHistory"] as! [String: Any]))
             }
-            #expect(engine.preview == "好耶，给本鱼加饭！")
+            #expect(engine.preview == modelText)
             return
         }
         if control == "pauseReview" {

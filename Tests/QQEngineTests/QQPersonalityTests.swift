@@ -83,7 +83,7 @@ private final class PersonalityModelProtocol: URLProtocol, @unchecked Sendable {
         PersonalityModelProtocol.reset()
         let cfg = URLSessionConfiguration.ephemeral; cfg.protocolClasses = [PersonalityModelProtocol.self]
         let session = URLSession(configuration: cfg); defer { session.invalidateAndCancel() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.endpoint = "ws://127.0.0.1:\(port)"; engine.config.expectedSelfID = "12345"
         if mode == "custom" { engine.config.effectivePersona.customName = "合成角色"; engine.config.effectivePersona.customPrompt = "SYNTHETIC_CUSTOM_STYLE：自然简短的游戏搭子。" }

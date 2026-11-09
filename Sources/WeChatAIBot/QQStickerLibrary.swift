@@ -59,7 +59,7 @@ struct QQStickerLibrary {
         let gentle = emotion == .neutral ? [] : available.filter { $0.emotion == .neutral }.shuffled()
         return Array(matching.prefix(12)) + Array(gentle.prefix(4))
     }
-    func data(for item: Item) -> Data? {
+    func data(for item: Item, forSending: Bool = false) -> Data? {
         let directory = item.id.hasPrefix("local-") ? localDirectory : directory
         guard let directory, item.file == (item.file as NSString).lastPathComponent,
               ["png", "webp", "jpg", "jpeg"].contains((item.file as NSString).pathExtension),
@@ -68,6 +68,7 @@ struct QQStickerLibrary {
               let data = try? Data(contentsOf: directory.appendingPathComponent(item.file)), data.count == bytes,
               SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == item.sha256 else { return nil }
         #if os(Linux)
+        if forSending { return (try? LinuxImages.process(data, mode: "sticker-send"))?.first }
         guard (try? LinuxImages.process(data, mode: "sticker")) != nil else { return nil }
         #else
         guard let image = CGImageSourceCreateWithData(data as CFData, nil), CGImageSourceGetCount(image) == 1,
@@ -75,6 +76,16 @@ struct QQStickerLibrary {
               let width = properties[kCGImagePropertyPixelWidth] as? Int,
               let height = properties[kCGImagePropertyPixelHeight] as? Int,
               (1...4096).contains(width), (1...4096).contains(height) else { return nil }
+        if forSending {
+            let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                            kCGImageSourceCreateThumbnailWithTransform: true,
+                                            kCGImageSourceThumbnailMaxPixelSize: max(1, max(width, height) / 3)]
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(image, 0, options as CFDictionary) else { return nil }
+            let output = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(output, "public.png" as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(destination, thumbnail, nil)
+            return CGImageDestinationFinalize(destination) ? output as Data : nil
+        }
         #endif
         return data
     }

@@ -77,6 +77,10 @@ public struct QQIncoming: Equatable, Sendable {
     public var mentionedUsers: [String] = []
     public var key: String { "\(group ? "group" : "private"):\(target)" }
     public var dedupKey: String { "\(key):\(id)" }
+    public func replacingText(_ text: String) -> Self {
+        Self(id: id, sender: sender, target: target, group: group, text: text, time: time, replyTo: replyTo,
+             images: images, mentionsSelf: mentionsSelf, isOwner: isOwner, mentionedUsers: mentionedUsers)
+    }
 }
 public enum QQPolicy {
     public static func identifier(_ value: Any?) -> String? {
@@ -163,8 +167,26 @@ public enum QQPolicy {
         guard let data = try? JSONSerialization.data(withJSONObject: context, options: [.sortedKeys]) else { return nil }
         return QQQuotedContext(text: String(decoding: data, as: UTF8.self), images: images)
     }
+    public static func replyParts(_ text: String) -> [String] {
+        // Keep URLs and decimal numbers intact while splitting ordinary prose.
+        let pattern = #"https?://[^\s，。；！？、]+|[0-9]+[.,][0-9]+|[，。；！？、,!?;\n]+"#
+        guard let matcher = try? NSRegularExpression(pattern: pattern) else { return [text] }
+        var start = text.startIndex
+        var parts: [String] = []
+        for match in matcher.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let range = Range(match.range, in: text),
+                  let first = text[range].first, "，。；！？、,!?;\n".contains(first) else { continue }
+            parts.append(text[start..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines))
+            start = range.upperBound
+        }
+        parts.append(text[start...].trimmingCharacters(in: .whitespacesAndNewlines))
+        let nonempty = parts.filter { !$0.isEmpty }
+        return nonempty.isEmpty ? [text] : nonempty
+    }
+
     public static func sendAction(target: QQTarget, text: String, image: Data? = nil) -> (String, [String: Any]) {
-        var segments: [[String: Any]] = [["type": "text", "data": ["text": text]]]
+        var segments: [[String: Any]] = []
+        if !text.isEmpty || image == nil { segments.append(["type": "text", "data": ["text": text]]) }
         if let image { segments.append(["type": "image", "data": ["file": "base64://" + image.base64EncodedString()]]) }
         return (target.group ? "send_group_msg" : "send_private_msg",
          [target.group ? "group_id" : "user_id": target.number,

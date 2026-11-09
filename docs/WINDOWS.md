@@ -32,7 +32,7 @@ wsl --set-version Ubuntu-24.04 2
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y git curl ca-certificates python3 python3-pil docker.io
+sudo apt-get install -y git curl ca-certificates python3 python3-pil libsqlite3-dev docker.io
 sudo systemctl start docker
 ```
 
@@ -118,6 +118,8 @@ wsl -d Ubuntu-24.04 -- bash -lc 'cd ~/dafeiyu-bot && exec bash scripts/start-lin
 ```
 
 ## 6. 日常操作、停止和升级
+
+启用「会话记忆」后，历史检索默认使用本机全文索引。要同时启用语义检索，在 Ubuntu 安装 `python3-venv`，然后从项目目录运行 `bash scripts/setup-history-semantic.sh`。安装后的推理在本机进行。大肥鱼会在连接后逐批索引已启用会话，模型文件缺失或本机推理不可用时会继续使用全文检索。
 
 - `/help` 查看命令；`/hot`、`/search 关键词`、`/next`、画师和性格命令见 [全部命令](COMMANDS.md)。命令分发不调用大模型；普通对话和主动接话会消耗模型额度。
 - 生图、外置识图和 Google 搜图在同一个面板配置；账户开通条件和费用见 [操作指南](USER_GUIDE.md)。没有配置的可选服务保持关闭。

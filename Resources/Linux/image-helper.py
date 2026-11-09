@@ -8,6 +8,7 @@ def process(payload):
     mode = payload['mode']
     limits = {'frames': (8_000_000, 12000, 40_000_000), 'artwork': (20_000_000, 12000, 40_000_000),
               'sticker': (3_000_000, 4096, 4096 * 4096), 'generated': (8_000_000, 4096, 8_000_000),
+              'sticker-send': (3_000_000, 4096, 4096 * 4096),
               'search': (3_000_000, 4096, 8_000_000), 'sticker-import': (3_000_000, 4096, 8_000_000)}
     byte_limit, edge, pixels = limits[mode]
     raw = base64.b64decode(payload['image'], validate=True)
@@ -49,6 +50,8 @@ def process(payload):
         if mode in ('sticker', 'generated'):
             return [base64.b64encode(raw).decode('ascii')]
         frame = frame.convert('RGBA')
+        if mode == 'sticker-send':
+            frame = frame.resize((max(1, frame.width // 3), max(1, frame.height // 3)), Image.Resampling.LANCZOS)
         if mode in ('frames', 'artwork'):
             frame.thumbnail((1280, 1280) if mode == 'frames' else (2048, 2048))
             # Composite transparency onto white, rather than misreading it as a black background.
@@ -56,9 +59,9 @@ def process(payload):
             background.paste(frame, mask=frame.getchannel('A'))
             frame = background
         output = io.BytesIO()
-        if mode == 'sticker-import':
+        if mode in ('sticker-import', 'sticker-send'):
             frame.info.clear()
-        frame.save(output, format='PNG' if mode in ('search', 'sticker-import') else 'JPEG', quality=80 if mode == 'frames' else 88)
+        frame.save(output, format='PNG' if mode in ('search', 'sticker-import', 'sticker-send') else 'JPEG', quality=80 if mode == 'frames' else 88)
         encoded = output.getvalue()
         if len(encoded) > (2_000_000 if mode == 'frames' else 3_000_000):
             raise ValueError('output size')

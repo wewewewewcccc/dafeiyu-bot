@@ -183,9 +183,11 @@ private final class ImageProviderFixture: URLProtocol, @unchecked Sendable {
         try server.run(); defer { if server.isRunning { server.terminate(); server.waitUntilExit() } }
         let port = try #require(Int(String(decoding: output.fileHandleForReading.availableData, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)))
         let session = session(mode); defer { session.invalidateAndCancel() }
-        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), imageGenerator: QQImageGenerator(session: session))
+        let engine = QQEngine(allowAuthenticationUI: false, storageDirectory: directory, modelClient: DeepSeekClient(session: session), imageGenerator: QQImageGenerator(session: session), replyQuietPeriod: .zero)
         defer { engine.disconnect() }
         engine.config.expectedSelfID = "12345"; engine.config.endpoint = "ws://127.0.0.1:\(port)"
+        engine.config.ai.cooldownSeconds = 1
+        engine.config.ai.effectiveSendLimits.globalIntervalSeconds = 1
         engine.saveImageGeneration(settings, zhipuKey: credentials.zhipuKey, cloudflareToken: credentials.cloudflareToken, persistCredentials: false)
         if mode == "quota" { engine.config.ai.dailyLimit = 2 }
         #expect(engine.useTemporaryCredentials(token: "synthetic-test-token", key: "synthetic"))
@@ -194,11 +196,12 @@ private final class ImageProviderFixture: URLProtocol, @unchecked Sendable {
         if mode == "proactive" { engine.config.effectiveGroupParticipationEnabled = true; engine.config.effectiveGroupParticipationEvery = 1 }
         engine.start(singleReply: true); try #require(engine.running)
         try Data().write(to: directory.appendingPathComponent("ready"))
-        let deadline = Date().addingTimeInterval(5)
+        let expectedSends = mode == "planDecline" ? 2 : 3
+        let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
             if mode == "hold" && ImageProviderFixture.captured.contains(where: { $0.url?.host == "open.bigmodel.cn" }) { engine.pause(); break }
             if mode == "quota" && engine.logs.contains(where: { $0.state == .failed }) { break }
-            if engine.sends.confirmed == 1 { break }
+            if engine.sends.confirmed == expectedSends { break }
             try await Task.sleep(nanoseconds: 20_000_000)
         }
         try await Task.sleep(nanoseconds: 100_000_000)
@@ -210,16 +213,22 @@ private final class ImageProviderFixture: URLProtocol, @unchecked Sendable {
             #expect((body["prompt"] as? String)?.contains("人类面孔") == true)
         }
         if ["fallback", "proactive"].contains(mode) {
-            #expect(engine.sends.confirmed == 1); #expect(!engine.running)
+            #expect(engine.sends.confirmed == expectedSends); #expect(!engine.running)
             #expect(engine.usage.calls == (mode == "proactive" ? 4 : 5)) // Intent planning, primary, backup, answer, semantic review.
             #expect(engine.imageGenerationStatus.contains(mode == "proactive" ? "生成成功" : "已切换备用"))
-            let payload = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("payload"))) as? [String: Any])
-            let segments = try #require(payload["message"] as? [[String: Any]])
-            #expect(segments.count == 2)
-            #expect((segments[1]["data"] as? [String: String])?["file"] == "base64://" + ImageProviderFixture.png.base64EncodedString())
-            #expect((segments[0]["data"] as? [String: String])?["text"]?.contains(mode == "proactive" ? "AI 生成 · 智谱" : "AI 生成 · Cloudflare") == true)
+            let lines = try String(contentsOf: directory.appendingPathComponent("payloads"), encoding: .utf8).split(separator: "\n")
+            let segments = try lines.map { line in
+                let payload = try #require(JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any])
+                let messages = try #require(payload["message"] as? [[String: Any]])
+                #expect(messages.count == 1)
+                return try #require(messages.first)
+            }
+            #expect(segments.compactMap { $0["type"] as? String } == ["text", "text", "image"])
+            #expect((segments.last?["data"] as? [String: String])?["file"] == "base64://" + ImageProviderFixture.png.base64EncodedString())
+            #expect(segments.compactMap { ($0["data"] as? [String: String])?["text"] }
+                .contains { $0.contains(mode == "proactive" ? "AI 生成 · 智谱" : "AI 生成 · Cloudflare") })
         } else if mode == "planDecline" {
-            #expect(engine.sends.confirmed == 1); #expect(engine.usage.calls == 3)
+            #expect(engine.sends.confirmed == expectedSends); #expect(engine.usage.calls == 3)
             #expect(ImageProviderFixture.captured.allSatisfy { $0.url?.host == "api.deepseek.com" })
             #expect(engine.imageGenerationStatus.contains("未调用图片接口"))
         } else {

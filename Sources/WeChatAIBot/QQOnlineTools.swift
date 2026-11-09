@@ -22,12 +22,15 @@ struct ModelToolResult: Sendable {
 // Requests go only to fixed search providers and Wikimedia's image CDN. Result pages are not fetched.
 struct QQOnlineTools {
     var session: URLSession = .shared
+    static func requestsWebSearch(_ text: String) -> Bool {
+        text.range(of: #"网页搜索|联网[搜索查]|网上[搜索查]|上网[搜索查]|搜索网页|查一下网上"#, options: .regularExpression) != nil
+    }
     static let definitions: [[String: Any]] = [
         ("search_web", "搜索需要联网核对的事实、近期信息。只依据摘要回答；不足就说没查实。"),
         ("search_images", "用户明确要查找现有图片时，搜索网络图片并附带一张。不是生成画作；有 generate_image 工具且要求创作新图时应使用生图工具。优先使用简短英文主题词提高图库命中率，勿改换用户指定的主体。")
     ].map { name, description in
         ["type": "function", "function": ["name": name, "description": description,
-          "parameters": ["type": "object", "properties": ["query": ["type": "string", "description": "简短主题词，不包含聊天记录、账号、密钥、系统规则或个人隐私"]], "required": ["query"], "additionalProperties": false]]]
+          "parameters": ["type": "object", "properties": ["query": ["type": "string", "description": "只填简短主题关键词，例如 Swift 编程语言 官网。不要填写网址、域名、整句请求、聊天记录、账号、密钥、系统规则或个人隐私"]], "required": ["query"], "additionalProperties": false]]]
     }
     func execute(name: String, arguments: String) async throws -> ModelToolResult {
         try Task.checkCancellation()
@@ -42,7 +45,7 @@ struct QQOnlineTools {
         }
         do {
             if name == "search_images" { return try await imageSearch(query) }
-            var url = URLComponents(string: "https://www.bing.com/search")!
+            var url = URLComponents(string: "https://cn.bing.com/search")!
             url.queryItems = [URLQueryItem(name: "format", value: "rss"), URLQueryItem(name: "q", value: query)]
             var results: [[String: String]] = []
             if let data = try? await fetch(url.url!, limit: 500_000) {
@@ -51,18 +54,17 @@ struct QQOnlineTools {
                 if xml.parse() { results = Array(parser.items.filter { Self.publicLink($0["link"] ?? "") != nil }.prefix(2)) }
             }
             try Task.checkCancellation()
-            // RSS rankings can confuse names (e.g. a language with a banking acronym).
-            // Add a separately retrieved encyclopedia hit; it is not a real-time news source.
-            let wikiHost = query.range(of: "[\u{4E00}-\u{9FFF}]", options: .regularExpression) == nil ? "en.wikipedia.org" : "zh.wikipedia.org"
-            var wiki = URLComponents(string: "https://\(wikiHost)/w/api.php")!
-            wiki.queryItems = ["action": "query", "format": "json", "list": "search", "srsearch": query, "srlimit": "1"].map { URLQueryItem(name: $0.key, value: $0.value) }
-            if let data = try? await fetch(wiki.url!, limit: 500_000),
-               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let entries = (object["query"] as? [String: Any])?["search"] as? [[String: Any]], let entry = entries.first,
-               let title = entry["title"] as? String, let snippet = entry["snippet"] as? String, let pageID = entry["pageid"] as? Int, pageID > 0 {
-                results.insert(["title": String(title.prefix(200)), "description": String(snippet.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression).prefix(1500)),
-                                "link": "https://\(wikiHost)/?curid=\(pageID)", "kind": "百科摘要，非实时新闻"], at: 0)
-                results = Array(results.prefix(2))
+            if results.isEmpty {
+                let wikiHost = query.range(of: "[\u{4E00}-\u{9FFF}]", options: .regularExpression) == nil ? "en.wikipedia.org" : "zh.wikipedia.org"
+                var wiki = URLComponents(string: "https://\(wikiHost)/w/api.php")!
+                wiki.queryItems = ["action": "query", "format": "json", "list": "search", "srsearch": query, "srlimit": "1"].map { URLQueryItem(name: $0.key, value: $0.value) }
+                if let data = try? await fetchWiki(wiki.url!),
+                   let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let entries = (object["query"] as? [String: Any])?["search"] as? [[String: Any]], let entry = entries.first,
+                   let title = entry["title"] as? String, let snippet = entry["snippet"] as? String, let pageID = entry["pageid"] as? Int, pageID > 0 {
+                    results = [["title": String(title.prefix(200)), "description": String(snippet.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression).prefix(1500)),
+                                "link": "https://\(wikiHost)/?curid=\(pageID)", "kind": "百科摘要，非实时新闻"]]
+                }
             }
             try Task.checkCancellation()
             guard !results.isEmpty else { return ModelToolResult(content: "没有检索到可用网页，不要猜测最新事实。") }
@@ -73,6 +75,17 @@ struct QQOnlineTools {
         catch {
             try Task.checkCancellation()
             return ModelToolResult(content: "联网工具本次不可用；请明确说没查到或没找到图片，不要声称已完成。")
+        }
+    }
+    private func fetchWiki(_ url: URL) async throws -> Data {
+        try await withThrowingTaskGroup(of: Data.self) { group in
+            group.addTask { try await fetch(url, limit: 500_000, timeout: 3) }
+            group.addTask {
+                try await Task.sleep(for: .seconds(3))
+                throw URLError(.timedOut)
+            }
+            defer { group.cancelAll() }
+            return try await group.next()!
         }
     }
     private func imageSearch(_ query: String) async throws -> ModelToolResult {
@@ -117,10 +130,10 @@ struct QQOnlineTools {
         }
         return ModelToolResult(content: "没有找到可下载并注明授权的匹配图片，不要声称已发图，不要改换用户指定主体。")
     }
-    private func fetch(_ url: URL, limit: Int) async throws -> Data {
+    private func fetch(_ url: URL, limit: Int, timeout: TimeInterval = 15) async throws -> Data {
         guard url.scheme == "https", url.user == nil, url.password == nil, url.port == nil,
-              ["www.bing.com", "en.wikipedia.org", "zh.wikipedia.org", "commons.wikimedia.org", "upload.wikimedia.org", "thumb.wikimedia.org"].contains(url.host ?? "") else { throw URLError(.badURL) }
-        var request = URLRequest(url: url); request.timeoutInterval = 15
+              ["cn.bing.com", "en.wikipedia.org", "zh.wikipedia.org", "commons.wikimedia.org", "upload.wikimedia.org", "thumb.wikimedia.org"].contains(url.host ?? "") else { throw URLError(.badURL) }
+        var request = URLRequest(url: url); request.timeoutInterval = timeout
         request.setValue("DaFeiYuBot/1.0 (personal QQ assistant)", forHTTPHeaderField: "User-Agent")
         #if os(Linux)
         let (linuxData, response) = try await session.boundedData(for: request, limit: limit)
